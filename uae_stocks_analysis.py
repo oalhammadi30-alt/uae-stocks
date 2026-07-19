@@ -46,6 +46,13 @@ DEFAULT_TICKERS = [
     "EMAARDEV.AE",   # إعمار للتطوير العقاري - دبي
 ]
 
+# رموز المؤشرات العامة للسوقين (لقياس هل حركة السهم بسبب السهم نفسه أو السوق كله)
+MARKET_INDICES = {
+    "مؤشر دبي العام (DFM General)": "DFMGI.AE",
+    "مؤشر أبوظبي العام (ADX General)": "FADGI.FGI",
+}
+
+
 # وزن كل مؤشر (نجوم المستخدم) يُستخدم في حساب الإشارة المركّبة النهائية
 WEIGHTS = {
     "nadaraya_watson": 5,
@@ -781,6 +788,87 @@ def summarize_backtest(trades, df, start_idx=200):
     }
 
 
+def short_term_signal_row(df):
+    """يبني إشارات قصيرة المدى بنفس أسلوب تطبيقات الوسطاء (Buy/Sell/Hold) لكل مؤشر."""
+    last = df.iloc[-1]
+
+    if last["RSI14"] < 30:
+        rsi_sig = "Buy"
+    elif last["RSI14"] > 70:
+        rsi_sig = "Sell"
+    else:
+        rsi_sig = "Hold"
+
+    ma20_sig = "Buy" if last["Close"] > last["EMA20"] else "Sell"
+    ma_cross_sig = "Buy" if last["EMA20"] > last["EMA50"] else "Sell"
+    macd_sig = "Buy" if last["MACD"] > last["MACD_Signal"] else "Sell"
+
+    return rsi_sig, ma20_sig, ma_cross_sig, macd_sig
+
+
+def weekly_prep_table(tickers, days=400, fetch_dividends=False):
+    """يبني جدول تحضير أسبوعي شامل لكل الأسهم دفعة وحدة: الإغلاق الأسبوعي،
+    نسبة التغيّر، إشارات قصيرة المدى، أقرب دعم/مقاومة، وتاريخ آخر توزيعة (اختياري)."""
+    rows = []
+    for ticker in tickers:
+        df = analyze_ticker(ticker, days)
+        if df is None:
+            rows.append({"الرمز": ticker, "خطأ": "لا توجد بيانات"})
+            continue
+
+        weekly = df["Close"].resample("W").last().dropna()
+        last_close = weekly.iloc[-1]
+        prev_close = weekly.iloc[-2] if len(weekly) > 1 else last_close
+        weekly_change = (last_close - prev_close) / prev_close * 100
+
+        rsi_sig, ma20_sig, ma_cross_sig, macd_sig = short_term_signal_row(df)
+        supports, resistances = support_resistance_levels(df)
+
+        row = {
+            "الرمز": ticker,
+            "آخر إغلاق أسبوعي": round(float(last_close), 3),
+            "تغيّر أسبوعي %": round(float(weekly_change), 2),
+            "RSI": rsi_sig,
+            "MA20 مقابل السعر": ma20_sig,
+            "MA20 مقابل MA50": ma_cross_sig,
+            "MACD": macd_sig,
+            "أقرب دعم": round(supports[0], 3) if supports else None,
+            "أقرب مقاومة": round(resistances[0], 3) if resistances else None,
+        }
+
+        if fetch_dividends:
+            try:
+                divs = yf.Ticker(ticker).dividends
+                if not divs.empty:
+                    row["آخر تاريخ توزيعة"] = divs.index[-1].date().isoformat()
+            except Exception:
+                pass
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def market_indices_summary(days=60):
+    """يجيب أداء مؤشري دبي وأبوظبي العامين آخر أسبوع، لمعرفة هل حركة أسهمك بسبب
+    السوق ككل أو بسبب السهم نفسه."""
+    results = {}
+    for name, ticker in MARKET_INDICES.items():
+        try:
+            df = yf.download(ticker, period=f"{days}d", progress=False, auto_adjust=True)
+            if df.empty:
+                results[name] = None
+                continue
+            weekly = df["Close"].resample("W").last().dropna()
+            last_val = float(weekly.iloc[-1])
+            prev_val = float(weekly.iloc[-2]) if len(weekly) > 1 else last_val
+            change = (last_val - prev_val) / prev_val * 100
+            results[name] = {"value": last_val, "weekly_change_pct": change}
+        except Exception:
+            results[name] = None
+    return results
+
+
 def print_backtest_results(ticker, trades, stats):
     print("\n╔══════════════ نتائج المحاكاة التاريخية (Backtest) ══════════════╗")
     if not trades or stats is None:
@@ -872,7 +960,22 @@ def main():
                          help="تشغيل محاكاة تاريخية (Backtest) للاستراتيجية بدل/مع التحليل الحي")
     parser.add_argument("--entry-threshold", type=float, default=0.15, help="عتبة Score للدخول بصفقة (افتراضي 0.15)")
     parser.add_argument("--exit-threshold", type=float, default=-0.05, help="عتبة Score للخروج من صفقة (افتراضي -0.05)")
+    parser.add_argument("--weekly-prep", action="store_true",
+                         help="عرض جدول تحضير أسبوعي مختصر لكل الأسهم بدل التحليل الكامل")
     args = parser.parse_args()
+
+    if args.weekly_prep:
+        print("📅 التحضير الأسبوعي\n" + "=" * 65)
+        idx = market_indices_summary()
+        for name, data in idx.items():
+            if data:
+                print(f"{name}: {data['value']:.2f}  ({data['weekly_change_pct']:+.2f}% أسبوعياً)")
+            else:
+                print(f"{name}: تعذّر الجلب")
+        print()
+        table = weekly_prep_table(args.tickers, args.days, fetch_dividends=not args.no_fundamentals)
+        print(table.to_string(index=False))
+        return
 
     if args.backtest and args.days < 600:
         print("ℹ️  لمحاكاة تاريخية ذات معنى، تم رفع --days تلقائياً إلى 600 (كنت قد حددت أقل من ذلك).\n")
